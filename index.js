@@ -1291,6 +1291,7 @@ window.addEventListener('beforeunload', () => {
 const BOT_TOKEN = "ENTER_YOUR_TELEGRAM_BOT_TOKEN";
 const BALE_BOT_TOKEN = "ENTER_YOUR_BALE_BOT_TOKEN";
 const BOT_WEBHOOK = "/endpoint";
+const BALE_WEBHOOK = "/bale-endpoint";
 
 // User Mapping: Telegram Sender → Bale Recipient
 const USER_MAPPING = {
@@ -1311,7 +1312,9 @@ async function handleRequest(request) {
   const url = new URL(request.url);
 
   if (url.pathname === BOT_WEBHOOK) return handleWebhook(request);
+  if (url.pathname === BALE_WEBHOOK) return handleBaleWebhook(request);
   if (url.pathname === '/registerWebhook') return registerWebhook(request);
+  if (url.pathname === '/registerBaleWebhook') return registerBaleWebhook(request);
   if (url.pathname === '/' || url.pathname === '/index.html') {
     return new Response(INDEX_HTML, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -1334,6 +1337,28 @@ async function registerWebhook(request) {
   const webhookUrl = `${url.protocol}//${url.hostname}${BOT_WEBHOOK}`;
 
   const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: webhookUrl })
+  });
+
+  return new Response(await response.text(), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// Bale
+async function handleBaleWebhook(request) {
+  const update = await request.json();
+  if (update.message) await processBaleMessage(update.message);
+  return new Response('OK');
+}
+
+async function registerBaleWebhook(request) {
+  const url = new URL(request.url);
+  const webhookUrl = `${url.protocol}//${url.hostname}${BALE_WEBHOOK}`;
+
+  const response = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/setWebhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url: webhookUrl })
@@ -1386,6 +1411,156 @@ async function processMessage(message) {
   if (message.audio)    { await handleAudioTransfer(userId, recipientId, message.audio);   return; }
 
   await sendTelegramMessage(userId, message.message_id, '❌ Please send a file or a valid URL.');
+}
+
+// ==================== Bale Message Processing ====================
+
+// Reverse mapping: Bale user → Telegram user (for authorization)
+const BALE_TO_TG = Object.fromEntries(
+  Object.entries(USER_MAPPING).map(([tg, bale]) => [bale, tg])
+);
+
+async function processBaleMessage(message) {
+  const baleUserId = String(message.chat.id);
+
+  // Only accept messages from known Bale recipients
+  if (!BALE_TO_TG[baleUserId]) {
+    await sendBaleMessage(baleUserId, '❌ You are not authorized to use this bot.');
+    return;
+  }
+
+  // /start command
+  if (message.text && message.text === '/start') {
+    await sendBaleMessage(baleUserId,
+      '👋 سلام!\n\n' +
+      'لینک دانلود مستقیم خود را بفرستید تا فایل دریافت و برای شما ارسال شود.\n\n' +
+      '🔗 لینک باید با http یا https شروع شود.\n' +
+      '📦 فایل‌های بزرگ به صورت خودکار تکه‌تکه ارسال می‌شوند.'
+    );
+    return;
+  }
+
+  // URL download
+  if (message.text) {
+    const match = message.text.match(URL_REGEX);
+    if (match) {
+      await handleBaleUrlTransfer(baleUserId, match[0]);
+      return;
+    }
+    await sendBaleMessage(baleUserId, '❌ لطفاً یک لینک دانلود مستقیم ارسال کنید.');
+    return;
+  }
+
+  await sendBaleMessage(baleUserId, '❌ لطفاً یک لینک دانلود مستقیم ارسال کنید.');
+}
+
+async function handleBaleUrlTransfer(baleUserId, url) {
+  try {
+    await sendBaleMessage(baleUserId, `🔗 در حال دانلود...\n\`${url}\``);
+
+    let response;
+    try {
+      response = await fetch(url, { redirect: 'follow' });
+    } catch (e) {
+      await sendBaleMessage(baleUserId, '❌ لینک قابل دسترسی نیست. مطمئن شوید لینک مستقیم و عمومی است.');
+      return;
+    }
+
+    if (!response.ok) {
+      await sendBaleMessage(baleUserId, `❌ سرور خطای HTTP ${response.status} برگرداند.`);
+      return;
+    }
+
+    // Detect filename
+    const disposition = response.headers.get('Content-Disposition') || '';
+    let fileName = 'file';
+    const dispMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+    if (dispMatch) {
+      fileName = decodeURIComponent(dispMatch[1].trim());
+    } else {
+      const urlPath = new URL(url).pathname;
+      const urlFileName = urlPath.split('/').pop();
+      if (urlFileName && urlFileName.includes('.')) fileName = decodeURIComponent(urlFileName);
+    }
+
+    const contentLength = response.headers.get('Content-Length');
+    if (contentLength) {
+      await sendBaleMessage(baleUserId, `📦 حجم فایل: ${formatSize(parseInt(contentLength))}\n⏳ در حال پردازش...`);
+    }
+
+    let fileBuffer = await response.arrayBuffer();
+    let totalSize = fileBuffer.byteLength;
+
+    let sendName = fileName;
+    if (shouldWrap(fileName)) {
+      await sendBaleMessage(baleUserId, `📦 در حال زیپ کردن \`${fileName}\`...`);
+      fileBuffer = buildZip(fileBuffer, fileName);
+      totalSize = fileBuffer.byteLength;
+      sendName = fileName.replace(/(\.[^.]+)+$/, '') + '.zip';
+    }
+
+    const chunks = Math.ceil(totalSize / CHUNK_SIZE);
+    await sendBaleMessage(baleUserId,
+      `✅ دانلود شد: ${formatSize(totalSize)}\n📤 در حال ارسال${chunks > 1 ? ` در ${chunks} بخش` : ''}...`
+    );
+
+    await sendBufferToBaleDirectly(baleUserId, fileBuffer, sendName);
+  } catch (error) {
+    console.error('Bale URL transfer error:', error);
+    await sendBaleMessage(baleUserId, '❌ خطای غیرمنتظره‌ای رخ داد.');
+  }
+}
+
+// Like sendBufferToBaleInChunks but sends directly to Bale user (no Telegram feedback)
+async function sendBufferToBaleDirectly(baleUserId, buffer, fileName) {
+  const totalSize = buffer.byteLength;
+
+  if (totalSize <= CHUNK_SIZE) {
+    const ok = await sendChunkToBale(baleUserId, buffer, fileName, 'document');
+    if (ok) {
+      await sendBaleMessage(baleUserId, '✅ فایل با موفقیت ارسال شد.');
+    } else {
+      await sendBaleMessage(baleUserId, '❌ بله فایل را رد کرد.');
+    }
+    return;
+  }
+
+  const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
+  const ext = fileName.includes('.') ? '.' + fileName.split('.').pop() : '';
+  const baseName = fileName.includes('.') ? fileName.slice(0, fileName.lastIndexOf('.')) : fileName;
+
+  let allOk = true;
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, totalSize);
+    const chunk = buffer.slice(start, end);
+    const chunkName = `${baseName}.part${i + 1}of${totalChunks}${ext}`;
+
+    await sendBaleMessage(baleUserId, `📤 ارسال بخش ${i + 1} از ${totalChunks} (${formatSize(chunk.byteLength)})...`);
+
+    const ok = await sendChunkToBale(baleUserId, chunk, chunkName, 'document');
+    if (!ok) {
+      await sendBaleMessage(baleUserId, `❌ ارسال بخش ${i + 1} از ${totalChunks} ناموفق بود.`);
+      allOk = false;
+      break;
+    }
+  }
+
+  if (allOk) {
+    await sendBaleMessage(baleUserId,
+      `✅ همه ${totalChunks} بخش با موفقیت ارسال شدند!\n\n` +
+      `ℹ️ برای ترکیب فایل‌ها از ابزار وب یا دستور زیر استفاده کنید:\n` +
+      `\`cat ${baseName}.part*of${totalChunks}${ext} > ${fileName}\``
+    );
+  }
+}
+
+async function sendBaleMessage(chatId, text) {
+  await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+  });
 }
 
 // ==================== File Transfer Handlers ====================
