@@ -133,3 +133,7 @@ No separate hosting is needed. The page runs 100% client-side.
 - There is no size limit when forwarding via URL, as long as the download completes within Cloudflare's Worker CPU time limits (typically sufficient for files up to a few hundred MB)
 - The auto-zip feature wraps only non-media, non-archive files. Images, videos, audio, PDFs, and existing archives are always forwarded as-is
 - The Bale bot only accepts URLs — it does not forward files sent directly to it, since Bale users are the recipients, not the senders
+
+---
+
+Thanks to - [ixabolfazl](https://github.com/ixabolfazl/telegram-to-bale-file-transfer-bot) for the idea
