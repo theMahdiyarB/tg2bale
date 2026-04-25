@@ -1,5 +1,7 @@
 # Telegram to Bale & Rubika File Transfer Bot
 
+> 🌐 **Language / زبان:** [🇬🇧 English](README.md) | [🇮🇷 فارسی](README.fa.md)
+
 A Cloudflare Worker that bridges Telegram, Bale, and Rubika — forwarding files, media, and download links from authorized Telegram users to their mapped recipients on Bale and/or Rubika. Only one file (`index.js`) needs to be deployed.
 
 ## Features
@@ -182,3 +184,234 @@ No separate hosting is needed. The page runs 100% client-side.
 ---
 
 Thanks to [ixabolfazl](https://github.com/ixabolfazl/telegram-to-bale-file-transfer-bot) for the original idea.
+
+---
+
+## Alternative Deployment Options
+
+### Deploying on Vercel
+
+Vercel can host this project as a serverless function. The free plan has a **10-second function timeout**, which is sufficient for small files and URL downloads. For large files or slow sources, upgrade to Pro (60s timeout) or use a VPS instead.
+
+#### 1. Install dependencies
+
+```bash
+npm install
+```
+
+#### 2. Create the Vercel entry point
+
+Create a file at `api/index.js` in your project root:
+
+```javascript
+import handler from '../index.js';
+
+export default async function (req, res) {
+  // Convert Node.js req/res to Web API Request/Response
+  const url = `https://${req.headers.host}${req.url}`;
+  const init = {
+    method: req.method,
+    headers: req.headers,
+  };
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    init.body = await new Promise((resolve) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+  }
+
+  const request = new Request(url, init);
+  const response = await handler.fetch(request);
+
+  res.status(response.status);
+  response.headers.forEach((value, key) => res.setHeader(key, value));
+  const body = await response.arrayBuffer();
+  res.end(Buffer.from(body));
+}
+```
+
+#### 3. Add a `vercel.json` config
+
+Create `vercel.json` in your project root:
+
+```json
+{
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+}
+```
+
+#### 4. Update `index.js` export
+
+At the very end of `index.js`, replace:
+
+```javascript
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+```
+
+With:
+
+```javascript
+// Cloudflare Workers
+if (typeof addEventListener !== 'undefined') {
+  addEventListener('fetch', event => {
+    event.respondWith(handleRequest(event.request));
+  });
+}
+
+// Node.js / Vercel export
+export default { fetch: handleRequest };
+```
+
+#### 5. Deploy
+
+```bash
+npm install -g vercel
+vercel login
+vercel --prod
+```
+
+Vercel will output your project URL (e.g. `https://your-project.vercel.app`).
+
+#### 6. Register webhooks
+
+```
+https://your-project.vercel.app/registerWebhook
+https://your-project.vercel.app/registerBaleWebhook
+https://your-project.vercel.app/registerRubikaWebhook
+```
+
+> **Rubika note:** Vercel's `.vercel.app` domain is not filtered in Iran, so Rubika webhook registration should work without a custom domain.
+
+---
+
+### Deploying on a VPS
+
+Running on a VPS gives you full control — no timeouts, no cold starts, no request limits. Any Ubuntu/Debian VPS with 512 MB RAM is sufficient.
+
+#### 1. Set up the server
+
+```bash
+sudo apt update && sudo apt install -y nodejs npm nginx certbot python3-certbot-nginx
+node -v  # Should be 18+. If not, install via nvm:
+# curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+# nvm install 18
+```
+
+#### 2. Clone your project and install dependencies
+
+```bash
+git clone https://github.com/your/repo.git tgbale && cd tgbale
+npm install
+```
+
+#### 3. Update `index.js` to support Node.js HTTP server
+
+At the very end of `index.js`, replace the `addEventListener` block with:
+
+```javascript
+// Cloudflare Workers
+if (typeof addEventListener !== 'undefined') {
+  addEventListener('fetch', event => {
+    event.respondWith(handleRequest(event.request));
+  });
+}
+
+// Node.js standalone server
+if (typeof process !== 'undefined' && process.versions?.node) {
+  const { createServer } = await import('node:http');
+  const PORT = process.env.PORT || 8787;
+
+  createServer(async (req, res) => {
+    const url = `http://${req.headers.host}${req.url}`;
+    const init = { method: req.method, headers: req.headers };
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      init.body = await new Promise((resolve) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+    }
+
+    const response = await handleRequest(new Request(url, init));
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    res.end(Buffer.from(await response.arrayBuffer()));
+  }).listen(PORT, () => console.log(`Listening on port ${PORT}`));
+}
+```
+
+#### 4. Get an SSL certificate
+
+```bash
+sudo certbot --nginx -d yourdomain.com
+```
+
+#### 5. Configure nginx as a reverse proxy
+
+```bash
+sudo nano /etc/nginx/sites-available/tgbale
+```
+
+Paste:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name yourdomain.com;
+
+    location / {
+        proxy_pass http://localhost:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tgbale /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+#### 6. Run the server with PM2 (persistent background process)
+
+```bash
+npm install -g pm2
+pm2 start "node index.js" --name tgbale
+pm2 save && pm2 startup
+```
+
+#### 7. Register webhooks
+
+```
+https://yourdomain.com/registerWebhook
+https://yourdomain.com/registerBaleWebhook
+https://yourdomain.com/registerRubikaWebhook
+```
+
+#### Useful PM2 commands
+
+```bash
+pm2 logs tgbale        # View live logs
+pm2 restart tgbale     # Restart after code changes
+pm2 stop tgbale        # Stop the server
+```
+
+---
+
+## Platform Comparison
+
+| | Cloudflare Workers | Vercel | VPS |
+|---|---|---|---|
+| Cost | Free tier available | Free tier available | ~$4–6/month |
+| Timeout | 10–50ms CPU (not wall time) | 10s (free) / 60s (Pro) | None |
+| Large file support | Limited by CPU time | Limited by timeout | ✅ Full |
+| Custom domain needed for Rubika | Yes (`*.workers.dev` blocked) | No | No |
+| Setup difficulty | Easy | Easy | Medium |
+| Persistent logs | Via Observability tab | Via Vercel dashboard | Via PM2 / journald |
