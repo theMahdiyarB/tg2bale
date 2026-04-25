@@ -25,9 +25,9 @@ A Cloudflare Worker that bridges Telegram, Bale, and Rubika — forwarding files
 3. **Bale Bot Token** — Get it from [@BotFather](https://ble.ir/botfather) on Bale
 4. **Rubika Bot Token** — Get it from [@BotFather](https://rubika.ir/botfather) on Rubika
 5. **User IDs**
-   - Telegram User ID: use [@userinfobot](https://t.me/userinfobot)
-   - Bale User ID: use [@userinfo_idbot](https://ble.ir/userinfo_idbot) or [@ShowChatdBot](https://ble.ir/ShowChatdBot)
-   - Rubika Chat ID: send `/start` to your Rubika bot after deploying — the bot will reply with your numeric ID
+   - send `/start` to your bots after deploying — the bot will reply with your numeric ID in all three platforms. Or you can get them from:
+      - Telegram User ID: use [@userinfobot](https://t.me/userinfobot)
+      - Bale User ID: use [@userinfo_idbot](https://ble.ir/userinfo_idbot) or [@ShowChatdBot](https://ble.ir/ShowChatdBot)
 
 ---
 
@@ -412,6 +412,5 @@ pm2 stop tgbale        # Stop the server
 | Cost | Free tier available | Free tier available | ~$4–6/month |
 | Timeout | 10–50ms CPU (not wall time) | 10s (free) / 60s (Pro) | None |
 | Large file support | Limited by CPU time | Limited by timeout | ✅ Full |
-| Custom domain needed for Rubika | Yes (`*.workers.dev` blocked) | No | No |
 | Setup difficulty | Easy | Easy | Medium |
 | Persistent logs | Via Observability tab | Via Vercel dashboard | Via PM2 / journald |
