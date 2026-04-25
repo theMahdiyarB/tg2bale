@@ -1290,12 +1290,18 @@ window.addEventListener('beforeunload', () => {
 
 const BOT_TOKEN = "ENTER_YOUR_TELEGRAM_BOT_TOKEN";
 const BALE_BOT_TOKEN = "ENTER_YOUR_BALE_BOT_TOKEN";
+const RUBIKA_BOT_TOKEN = "ENTER_YOUR_RUBIKA_BOT_TOKEN";
 const BOT_WEBHOOK = "/endpoint";
 const BALE_WEBHOOK = "/bale-endpoint";
+const RUBIKA_WEBHOOK = "/rubika-endpoint";
 
-// User Mapping: Telegram Sender → Bale Recipient
+// User Mapping: Telegram Sender → { bale, rubika } recipients
+// Both bale and rubika are optional — include only the ones you need.
 const USER_MAPPING = {
-  "TELEGRAM_USER_ID": "BALE_USER_ID",
+  "TELEGRAM_USER_ID": {
+    bale: "BALE_USER_ID",
+    rubika: "RUBIKA_CHAT_ID", // remove this line if not using Rubika
+  },
 };
 
 const TELEGRAM_MAX_DOWNLOAD = 20 * 1024 * 1024; // Telegram hard limit: 20 MB
@@ -1313,8 +1319,11 @@ async function handleRequest(request) {
 
   if (url.pathname === BOT_WEBHOOK) return handleWebhook(request);
   if (url.pathname === BALE_WEBHOOK) return handleBaleWebhook(request);
+  if (url.pathname === RUBIKA_WEBHOOK) return handleRubikaWebhook(request);
   if (url.pathname === '/registerWebhook') return registerWebhook(request);
   if (url.pathname === '/registerBaleWebhook') return registerBaleWebhook(request);
+  if (url.pathname === '/registerRubikaWebhook') return registerRubikaWebhook(request);
+  if (url.pathname === '/debug') return handleDebug(request);
   if (url.pathname === '/' || url.pathname === '/index.html') {
     return new Response(INDEX_HTML, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -1349,7 +1358,15 @@ async function registerWebhook(request) {
 
 // Bale
 async function handleBaleWebhook(request) {
-  const update = await request.json();
+  let update;
+  try {
+    update = await request.json();
+  } catch (e) {
+    return new Response('OK');
+  }
+
+  console.log('Bale webhook payload:', JSON.stringify(update));
+
   if (update.message) await processBaleMessage(update.message);
   return new Response('OK');
 }
@@ -1369,27 +1386,75 @@ async function registerBaleWebhook(request) {
   });
 }
 
+// Rubika
+async function handleRubikaWebhook(request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response('OK');
+  }
+
+  console.log('Rubika webhook payload:', JSON.stringify(body));
+
+  // Rubika payload per docs:
+  // { "update": { "type": "NewMessage", "chat_id": "...", "new_message": { "text": "...", ... } } }
+  const update = body.update;
+  if (update && update.new_message) {
+    const chatId = update.chat_id || update.new_message.sender_id;
+    await processRubikaMessage(String(chatId), update.new_message);
+  }
+
+  return new Response('OK');
+}
+
+async function registerRubikaWebhook(request) {
+  const url = new URL(request.url);
+  const webhookUrl = `${url.protocol}//${url.hostname}${RUBIKA_WEBHOOK}`;
+
+  // Rubika requires registering each event type separately
+  const result = await rubikaPost('updateBotEndpoints', {
+    url: webhookUrl,
+    type: 'ReceiveUpdate',
+  });
+
+  return new Response(JSON.stringify(result), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// Debug: echoes the raw incoming request body — point Bale/Rubika webhook here temporarily
+async function handleDebug(request) {
+  const body = await request.text();
+  return new Response(body || '(empty body)', {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
 // ==================== Message Processing ====================
 
 async function processMessage(message) {
-  const userId = message.chat.id;
-  const recipientId = USER_MAPPING[userId];
+  const userId = String(message.chat.id);
+  const mapping = USER_MAPPING[userId];
 
-  if (!recipientId) {
-    await sendTelegramMessage(userId, message.message_id, '❌ You are not authorized to use this bot.');
+  if (!mapping) {
+    await sendTelegramMessage(userId, message.message_id, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${userId}`);
     return;
   }
 
+  const baleRecipient   = mapping.bale   || null;
+  const rubikaRecipient = mapping.rubika || null;
+
   // /start command
   if (message.text && message.text === '/start') {
+    const targets = [baleRecipient && 'بله', rubikaRecipient && 'روبیکا'].filter(Boolean).join(' و ');
     const welcomeText =
-      '👋 Welcome!\n\n' +
-      'Send a file or a download link to forward it to the recipient.\n\n' +
-      '📁 Files over 20 MB will be split into chunks automatically.\n' +
-      '🔗 Send a URL (starting with http/https) to download & forward it.\n\n' +
-      '🗜 *Auto-zip:* Some files (e.g. APK, EXE, ISO) are automatically zipped before sending to bypass Bale filters. ' +
-      'The recipient just needs to extract the zip — the original file with its correct name is inside.\n' +
-      'Use the reassembly/tools page: https://your-pages-site.pages.dev';
+      '👋 سلام!\n\n' +
+      `فایل‌ها به *${targets}* ارسال می‌شوند.\n\n` +
+      '📁 فایل‌های بیش از ۲۰ مگابایت به صورت خودکار تکه‌تکه ارسال می‌شوند.\n' +
+      '🔗 لینک دانلود مستقیم (http/https) بفرستید تا فایل دانلود و ارسال شود.\n\n' +
+      '🗜 *زیپ خودکار:* برخی فایل‌ها (مثل APK، EXE، ISO) قبل از ارسال زیپ می‌شوند. گیرنده فقط باید فایل را از حالت فشرده خارج کند.\n' +
+      'ابزار ترکیب و تغییر نام: https://your-pages-site.pages.dev';
     await sendTelegramMessage(userId, message.message_id, welcomeText);
     return;
   }
@@ -1398,34 +1463,38 @@ async function processMessage(message) {
   if (message.text) {
     const match = message.text.match(URL_REGEX);
     if (match) {
-      await handleUrlTransfer(userId, recipientId, match[0]);
+      await handleUrlTransfer(userId, baleRecipient, rubikaRecipient, match[0]);
       return;
     }
-    await sendTelegramMessage(userId, message.message_id, '❌ Please send a file or a valid URL.');
+    await sendTelegramMessage(userId, message.message_id, '❌ لطفاً یک فایل یا لینک معتبر ارسال کنید.');
     return;
   }
 
-  if (message.document) { await handleFileTransfer(userId, recipientId, message.document); return; }
-  if (message.photo)    { await handlePhotoTransfer(userId, recipientId, message.photo);   return; }
-  if (message.video)    { await handleVideoTransfer(userId, recipientId, message.video);   return; }
-  if (message.audio)    { await handleAudioTransfer(userId, recipientId, message.audio);   return; }
+  if (message.document) { await handleFileTransfer(userId, baleRecipient, rubikaRecipient, message.document); return; }
+  if (message.photo)    { await handlePhotoTransfer(userId, baleRecipient, rubikaRecipient, message.photo);   return; }
+  if (message.video)    { await handleVideoTransfer(userId, baleRecipient, rubikaRecipient, message.video);   return; }
+  if (message.audio)    { await handleAudioTransfer(userId, baleRecipient, rubikaRecipient, message.audio);   return; }
 
-  await sendTelegramMessage(userId, message.message_id, '❌ Please send a file or a valid URL.');
+  await sendTelegramMessage(userId, message.message_id, '❌ لطفاً یک فایل یا لینک معتبر ارسال کنید.');
 }
 
 // ==================== Bale Message Processing ====================
 
 // Reverse mapping: Bale user → Telegram user (for authorization)
 const BALE_TO_TG = Object.fromEntries(
-  Object.entries(USER_MAPPING).map(([tg, bale]) => [bale, tg])
+  Object.entries(USER_MAPPING)
+    .filter(([, m]) => m.bale)
+    .map(([tg, m]) => [String(m.bale), tg])
 );
 
 async function processBaleMessage(message) {
-  const baleUserId = String(message.chat.id);
+  // Bale sometimes sends chat.id, sometimes from.id — check both
+  const baleUserId = String(message.chat?.id || message.from?.id || '');
+  if (!baleUserId) return;
 
   // Only accept messages from known Bale recipients
   if (!BALE_TO_TG[baleUserId]) {
-    await sendBaleMessage(baleUserId, '❌ You are not authorized to use this bot.');
+    await sendBaleMessage(baleUserId, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${baleUserId}`);
     return;
   }
 
@@ -1559,132 +1628,134 @@ async function sendBaleMessage(chatId, text) {
   await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+    body: JSON.stringify({ chat_id: chatId, text })
   });
 }
 
-// ==================== File Transfer Handlers ====================
+// ==================== Rubika API ====================
 
-async function handleFileTransfer(senderId, recipientId, document) {
-  // Telegram itself won't give us files >20 MB via getFile, so we inform the user.
-  if (document.file_size && document.file_size > TELEGRAM_MAX_DOWNLOAD) {
-    await sendTelegramMessage(senderId, null,
-      `⚠️ Telegram's API does not allow bots to download files larger than 20 MB.\n` +
-      `📦 File size: ${formatSize(document.file_size)}\n\n` +
-      `Please upload the file somewhere (e.g. Google Drive, Dropbox) and send me the direct download link instead.`
-    );
+async function rubikaPost(method, body) {
+  const response = await fetch(`https://botapi.rubika.ir/v3/${RUBIKA_BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return response.json();
+}
+
+async function sendRubikaMessage(chatId, text) {
+  await rubikaPost('sendMessage', { chat_id: chatId, text });
+}
+
+async function sendRubikaDocument(chatId, fileBuffer, fileName) {
+  const mimeType = guessMimeType(fileName);
+  const formData = new FormData();
+  formData.append('chat_id', chatId);
+  formData.append('document', new Blob([fileBuffer], { type: mimeType }), fileName);
+
+  const response = await fetch(`https://botapi.rubika.ir/v3/${RUBIKA_BOT_TOKEN}/sendDocument`, {
+    method: 'POST',
+    body: formData
+  });
+  const result = await response.json();
+  return result.ok || result.status === 'OK';
+}
+
+async function sendBufferToRubikaInChunks(senderId, rubikaRecipient, buffer, fileName) {
+  const totalSize = buffer.byteLength;
+
+  if (totalSize <= CHUNK_SIZE) {
+    const ok = await sendRubikaDocument(rubikaRecipient, buffer, fileName);
+    if (senderId && !ok) await sendTelegramMessage(senderId, null, '❌ روبیکا فایل را رد کرد.');
     return;
   }
 
-  try {
-    await sendTelegramMessage(senderId, null, '⏳ Downloading from Telegram...');
-    const file = await getFile(document.file_id);
-    let fileBuffer = await downloadFile(file.file_path);
-    const rawName = document.file_name || 'file';
+  const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
+  const ext = fileName.includes('.') ? '.' + fileName.split('.').pop() : '';
+  const baseName = fileName.includes('.') ? fileName.slice(0, fileName.lastIndexOf('.')) : fileName;
 
-    let sendName = rawName;
-    if (shouldWrap(rawName)) {
-      await sendTelegramMessage(senderId, null, `📦 Zipping \`${rawName}\` for delivery...`);
-      fileBuffer = buildZip(fileBuffer, rawName);
-      sendName = rawName.replace(/(\.[^.]+)+$/, '') + '.zip';
+  let allOk = true;
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, totalSize);
+    const chunk = buffer.slice(start, end);
+    const chunkName = `${baseName}.part${i + 1}of${totalChunks}${ext}`;
+
+    if (senderId) await sendTelegramMessage(senderId, null, `📤 ارسال به روبیکا: بخش ${i + 1} از ${totalChunks}...`);
+
+    const ok = await sendRubikaDocument(rubikaRecipient, chunk, chunkName);
+    if (!ok) {
+      if (senderId) await sendTelegramMessage(senderId, null, `❌ روبیکا: ارسال بخش ${i + 1} از ${totalChunks} ناموفق بود.`);
+      allOk = false;
+      break;
     }
+  }
 
-    await sendTelegramMessage(senderId, null, `📤 Sending to Bale${fileBuffer.byteLength > CHUNK_SIZE ? ' (splitting into chunks)' : ''}...`);
-    await sendBufferToBaleInChunks(senderId, recipientId, fileBuffer, sendName, 'document');
-  } catch (error) {
-    console.error('Error transferring file:', error);
-    await sendTelegramMessage(senderId, null, '❌ Error while transferring file.');
+  if (allOk && senderId) {
+    await sendTelegramMessage(senderId, null, `✅ همه ${totalChunks} بخش به روبیکا ارسال شد.`);
   }
 }
 
-async function handlePhotoTransfer(senderId, recipientId, photos) {
-  try {
-    await sendTelegramMessage(senderId, null, '⏳ Processing...');
-    const largestPhoto = photos[photos.length - 1];
-    const file = await getFile(largestPhoto.file_id);
-    const fileBuffer = await downloadFile(file.file_path);
+// ==================== Rubika Message Processing ====================
 
-    const formData = new FormData();
-    formData.append('chat_id', recipientId);
-    formData.append('photo', new Blob([fileBuffer], { type: 'image/jpeg' }), 'photo.jpg');
-
-    const result = await balePost('sendPhoto', formData);
-    if (result.ok) {
-      await sendTelegramMessage(senderId, null, '✅ Photo sent successfully.');
-    } else {
-      await sendTelegramMessage(senderId, null, `❌ Error: ${result.description}`);
-    }
-  } catch (error) {
-    console.error('Error transferring photo:', error);
-    await sendTelegramMessage(senderId, null, '❌ Error while transferring photo.');
+function getRubikaToTgMap() {
+  const map = {};
+  for (const [tgId, mapping] of Object.entries(USER_MAPPING)) {
+    if (mapping.rubika) map[String(mapping.rubika)] = tgId;
   }
+  return map;
 }
 
-async function handleVideoTransfer(senderId, recipientId, video) {
-  if (video.file_size && video.file_size > TELEGRAM_MAX_DOWNLOAD) {
-    await sendTelegramMessage(senderId, null,
-      `⚠️ Telegram's API does not allow bots to download files larger than 20 MB.\n` +
-      `📦 File size: ${formatSize(video.file_size)}\n\n` +
-      `Please upload the file somewhere and send me the direct download link instead.`
+async function processRubikaMessage(chatId, newMessage) {
+  const rubikaId = String(chatId || '');
+  if (!rubikaId) return;
+
+  const rubikaTgMap = getRubikaToTgMap();
+  if (!rubikaTgMap[rubikaId]) {
+    await sendRubikaMessage(rubikaId, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${rubikaId}`);
+    return;
+  }
+
+  const text = (newMessage.text || '').trim();
+
+  if (text === '/start') {
+    await sendRubikaMessage(rubikaId,
+      '👋 سلام!\n\n' +
+      'لینک دانلود مستقیم خود را بفرستید تا فایل دریافت و برای شما ارسال شود.\n\n' +
+      '🔗 لینک باید با http یا https شروع شود.\n' +
+      '📦 فایل‌های بزرگ به صورت خودکار تکه‌تکه ارسال می‌شوند.'
     );
     return;
   }
 
-  try {
-    await sendTelegramMessage(senderId, null, '⏳ Processing...');
-    const file = await getFile(video.file_id);
-    const fileBuffer = await downloadFile(file.file_path);
-
-    await sendTelegramMessage(senderId, null, `📤 Sending to Bale...`);
-    await sendBufferToBaleInChunks(senderId, recipientId, fileBuffer, 'video.mp4', 'video');
-  } catch (error) {
-    console.error('Error transferring video:', error);
-    await sendTelegramMessage(senderId, null, '❌ Error while transferring video.');
-  }
-}
-
-async function handleAudioTransfer(senderId, recipientId, audio) {
-  if (audio.file_size && audio.file_size > TELEGRAM_MAX_DOWNLOAD) {
-    await sendTelegramMessage(senderId, null,
-      `⚠️ Telegram's API does not allow bots to download files larger than 20 MB.\n\n` +
-      `Please send me a direct download link instead.`
-    );
+  const match = text.match(URL_REGEX);
+  if (match) {
+    await handleRubikaUrlTransfer(rubikaId, match[0]);
     return;
   }
 
-  try {
-    await sendTelegramMessage(senderId, null, '⏳ Processing...');
-    const file = await getFile(audio.file_id);
-    const fileBuffer = await downloadFile(file.file_path);
-
-    await sendTelegramMessage(senderId, null, `📤 Sending to Bale...`);
-    await sendBufferToBaleInChunks(senderId, recipientId, fileBuffer, audio.file_name || 'audio.mp3', 'audio');
-  } catch (error) {
-    console.error('Error transferring audio:', error);
-    await sendTelegramMessage(senderId, null, '❌ Error while transferring audio.');
+  if (text) {
+    await sendRubikaMessage(rubikaId, '❌ لطفاً یک لینک دانلود مستقیم ارسال کنید.');
   }
 }
 
-// ==================== URL Download & Transfer ====================
-
-async function handleUrlTransfer(senderId, recipientId, url) {
+async function handleRubikaUrlTransfer(rubikaId, url) {
   try {
-    await sendTelegramMessage(senderId, null, `🔗 Downloading from URL...\n\`${url}\``);
+    await sendRubikaMessage(rubikaId, `🔗 در حال دانلود...\n${url}`);
 
     let response;
     try {
       response = await fetch(url, { redirect: 'follow' });
     } catch (e) {
-      await sendTelegramMessage(senderId, null, `❌ Could not reach the URL. Make sure it is a valid, publicly accessible link.`);
+      await sendRubikaMessage(rubikaId, '❌ لینک قابل دسترسی نیست.');
       return;
     }
 
     if (!response.ok) {
-      await sendTelegramMessage(senderId, null, `❌ Server returned HTTP ${response.status}. Make sure the link is a direct download URL.`);
+      await sendRubikaMessage(rubikaId, `❌ سرور خطای HTTP ${response.status} برگرداند.`);
       return;
     }
 
-    // Try to figure out file name from URL or Content-Disposition header
     const disposition = response.headers.get('Content-Disposition') || '';
     let fileName = 'file';
     const dispMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
@@ -1698,7 +1769,176 @@ async function handleUrlTransfer(senderId, recipientId, url) {
 
     const contentLength = response.headers.get('Content-Length');
     if (contentLength) {
-      await sendTelegramMessage(senderId, null, `📦 File size: ${formatSize(parseInt(contentLength))}\n⏳ Buffering...`);
+      await sendRubikaMessage(rubikaId, `📦 حجم فایل: ${formatSize(parseInt(contentLength))}\n⏳ در حال پردازش...`);
+    }
+
+    let fileBuffer = await response.arrayBuffer();
+    let sendName = fileName;
+
+    if (shouldWrap(fileName)) {
+      fileBuffer = buildZip(fileBuffer, fileName);
+      sendName = fileName.replace(/(\.[^.]+)+$/, '') + '.zip';
+      await sendRubikaMessage(rubikaId, `📦 فایل زیپ شد: ${sendName}`);
+    }
+
+    const totalSize = fileBuffer.byteLength;
+    const chunks = Math.ceil(totalSize / CHUNK_SIZE);
+    await sendRubikaMessage(rubikaId,
+      `✅ دانلود شد: ${formatSize(totalSize)}\n📤 در حال ارسال${chunks > 1 ? ` در ${chunks} بخش` : ''}...`
+    );
+
+    await sendBufferToRubikaInChunks(null, rubikaId, fileBuffer, sendName);
+
+    if (chunks === 1) await sendRubikaMessage(rubikaId, '✅ فایل با موفقیت ارسال شد.');
+  } catch (error) {
+    console.error('Rubika URL transfer error:', error);
+    await sendRubikaMessage(rubikaId, '❌ خطای غیرمنتظره‌ای رخ داد.');
+  }
+}
+
+// ==================== File Transfer Handlers ====================
+
+async function handleFileTransfer(senderId, baleRecipient, rubikaRecipient, document) {
+  if (document.file_size && document.file_size > TELEGRAM_MAX_DOWNLOAD) {
+    await sendTelegramMessage(senderId, null,
+      `⚠️ تلگرام به ربات‌ها اجازه دانلود فایل بیش از ۲۰ مگابایت را نمی‌دهد.\n` +
+      `📦 حجم فایل: ${formatSize(document.file_size)}\n\n` +
+      `لطفاً فایل را در جایی آپلود کنید (مثل Google Drive) و لینک دانلود مستقیم آن را بفرستید.`
+    );
+    return;
+  }
+
+  try {
+    await sendTelegramMessage(senderId, null, '⏳ در حال دانلود از تلگرام...');
+    const file = await getFile(document.file_id);
+    let fileBuffer = await downloadFile(file.file_path);
+    const rawName = document.file_name || 'file';
+
+    let sendName = rawName;
+    if (shouldWrap(rawName)) {
+      await sendTelegramMessage(senderId, null, `📦 در حال زیپ کردن \`${rawName}\`...`);
+      fileBuffer = buildZip(fileBuffer, rawName);
+      sendName = rawName.replace(/(\.[^.]+)+$/, '') + '.zip';
+    }
+
+    const chunks = fileBuffer.byteLength > CHUNK_SIZE ? ' (تکه‌تکه)' : '';
+    await sendTelegramMessage(senderId, null, `📤 در حال ارسال${chunks}...`);
+
+    if (baleRecipient)   await sendBufferToBaleInChunks(senderId, baleRecipient, fileBuffer, sendName, 'document');
+    if (rubikaRecipient) await sendBufferToRubikaInChunks(senderId, rubikaRecipient, fileBuffer, sendName);
+  } catch (error) {
+    console.error('Error transferring file:', error);
+    await sendTelegramMessage(senderId, null, '❌ خطا در انتقال فایل.');
+  }
+}
+
+async function handlePhotoTransfer(senderId, baleRecipient, rubikaRecipient, photos) {
+  try {
+    await sendTelegramMessage(senderId, null, '⏳ در حال پردازش...');
+    const largestPhoto = photos[photos.length - 1];
+    const file = await getFile(largestPhoto.file_id);
+    const fileBuffer = await downloadFile(file.file_path);
+
+    if (baleRecipient) {
+      const formData = new FormData();
+      formData.append('chat_id', baleRecipient);
+      formData.append('photo', new Blob([fileBuffer], { type: 'image/jpeg' }), 'photo.jpg');
+      const result = await balePost('sendPhoto', formData);
+      if (!result.ok) await sendTelegramMessage(senderId, null, `❌ خطای بله: ${result.description}`);
+    }
+
+    if (rubikaRecipient) {
+      await sendBufferToRubikaInChunks(senderId, rubikaRecipient, fileBuffer, 'photo.jpg');
+    }
+
+    await sendTelegramMessage(senderId, null, '✅ عکس با موفقیت ارسال شد.');
+  } catch (error) {
+    console.error('Error transferring photo:', error);
+    await sendTelegramMessage(senderId, null, '❌ خطا در ارسال عکس.');
+  }
+}
+
+async function handleVideoTransfer(senderId, baleRecipient, rubikaRecipient, video) {
+  if (video.file_size && video.file_size > TELEGRAM_MAX_DOWNLOAD) {
+    await sendTelegramMessage(senderId, null,
+      `⚠️ تلگرام به ربات‌ها اجازه دانلود فایل بیش از ۲۰ مگابایت را نمی‌دهد.\n` +
+      `📦 حجم فایل: ${formatSize(video.file_size)}\n\n` +
+      `لطفاً فایل را در جایی آپلود کنید و لینک دانلود مستقیم آن را بفرستید.`
+    );
+    return;
+  }
+
+  try {
+    await sendTelegramMessage(senderId, null, '⏳ در حال پردازش...');
+    const file = await getFile(video.file_id);
+    const fileBuffer = await downloadFile(file.file_path);
+
+    await sendTelegramMessage(senderId, null, `📤 در حال ارسال...`);
+    if (baleRecipient)   await sendBufferToBaleInChunks(senderId, baleRecipient, fileBuffer, 'video.mp4', 'video');
+    if (rubikaRecipient) await sendBufferToRubikaInChunks(senderId, rubikaRecipient, fileBuffer, 'video.mp4');
+  } catch (error) {
+    console.error('Error transferring video:', error);
+    await sendTelegramMessage(senderId, null, '❌ خطا در ارسال ویدیو.');
+  }
+}
+
+async function handleAudioTransfer(senderId, baleRecipient, rubikaRecipient, audio) {
+  if (audio.file_size && audio.file_size > TELEGRAM_MAX_DOWNLOAD) {
+    await sendTelegramMessage(senderId, null,
+      `⚠️ تلگرام به ربات‌ها اجازه دانلود فایل بیش از ۲۰ مگابایت را نمی‌دهد.\n\n` +
+      `لطفاً لینک دانلود مستقیم فایل را بفرستید.`
+    );
+    return;
+  }
+
+  try {
+    await sendTelegramMessage(senderId, null, '⏳ در حال پردازش...');
+    const file = await getFile(audio.file_id);
+    const fileBuffer = await downloadFile(file.file_path);
+    const audioName = audio.file_name || 'audio.mp3';
+
+    await sendTelegramMessage(senderId, null, `📤 در حال ارسال...`);
+    if (baleRecipient)   await sendBufferToBaleInChunks(senderId, baleRecipient, fileBuffer, audioName, 'audio');
+    if (rubikaRecipient) await sendBufferToRubikaInChunks(senderId, rubikaRecipient, fileBuffer, audioName);
+  } catch (error) {
+    console.error('Error transferring audio:', error);
+    await sendTelegramMessage(senderId, null, '❌ خطا در ارسال فایل صوتی.');
+  }
+}
+
+// ==================== URL Download & Transfer ====================
+
+async function handleUrlTransfer(senderId, baleRecipient, rubikaRecipient, url) {
+  try {
+    await sendTelegramMessage(senderId, null, `🔗 در حال دانلود از لینک...\n\`${url}\``);
+
+    let response;
+    try {
+      response = await fetch(url, { redirect: 'follow' });
+    } catch (e) {
+      await sendTelegramMessage(senderId, null, `❌ لینک قابل دسترسی نیست. مطمئن شوید لینک مستقیم و عمومی است.`);
+      return;
+    }
+
+    if (!response.ok) {
+      await sendTelegramMessage(senderId, null, `❌ سرور خطای HTTP ${response.status} برگرداند. مطمئن شوید لینک دانلود مستقیم است.`);
+      return;
+    }
+
+    const disposition = response.headers.get('Content-Disposition') || '';
+    let fileName = 'file';
+    const dispMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+    if (dispMatch) {
+      fileName = decodeURIComponent(dispMatch[1].trim());
+    } else {
+      const urlPath = new URL(url).pathname;
+      const urlFileName = urlPath.split('/').pop();
+      if (urlFileName && urlFileName.includes('.')) fileName = decodeURIComponent(urlFileName);
+    }
+
+    const contentLength = response.headers.get('Content-Length');
+    if (contentLength) {
+      await sendTelegramMessage(senderId, null, `📦 حجم فایل: ${formatSize(parseInt(contentLength))}\n⏳ در حال دریافت...`);
     }
 
     let fileBuffer = await response.arrayBuffer();
@@ -1706,7 +1946,7 @@ async function handleUrlTransfer(senderId, recipientId, url) {
 
     let sendName = fileName;
     if (shouldWrap(fileName)) {
-      await sendTelegramMessage(senderId, null, `📦 Zipping \`${fileName}\` for delivery...`);
+      await sendTelegramMessage(senderId, null, `📦 در حال زیپ کردن \`${fileName}\`...`);
       fileBuffer = buildZip(fileBuffer, fileName);
       totalSize = fileBuffer.byteLength;
       sendName = fileName.replace(/(\.[^.]+)+$/, '') + '.zip';
@@ -1714,13 +1954,14 @@ async function handleUrlTransfer(senderId, recipientId, url) {
 
     const chunks = Math.ceil(totalSize / CHUNK_SIZE);
     await sendTelegramMessage(senderId, null,
-      `✅ Downloaded: ${formatSize(totalSize)}\n📤 Sending to Bale${chunks > 1 ? ` in ${chunks} parts` : ''}...`
+      `✅ دانلود شد: ${formatSize(totalSize)}\n📤 در حال ارسال${chunks > 1 ? ` در ${chunks} بخش` : ''}...`
     );
 
-    await sendBufferToBaleInChunks(senderId, recipientId, fileBuffer, sendName, 'document');
+    if (baleRecipient)   await sendBufferToBaleInChunks(senderId, baleRecipient, fileBuffer, sendName, 'document');
+    if (rubikaRecipient) await sendBufferToRubikaInChunks(senderId, rubikaRecipient, fileBuffer, sendName);
   } catch (error) {
     console.error('Error in URL transfer:', error);
-    await sendTelegramMessage(senderId, null, '❌ Unexpected error while processing the URL.');
+    await sendTelegramMessage(senderId, null, '❌ خطای غیرمنتظره‌ای در پردازش لینک رخ داد.');
   }
 }
 
@@ -1736,9 +1977,9 @@ async function sendBufferToBaleInChunks(senderId, recipientId, buffer, fileName,
   if (totalSize <= CHUNK_SIZE) {
     const success = await sendChunkToBale(recipientId, buffer, fileName, mediaType);
     if (success) {
-      await sendTelegramMessage(senderId, null, '✅ Sent successfully.');
+      await sendTelegramMessage(senderId, null, '✅ با موفقیت ارسال شد.');
     } else {
-      await sendTelegramMessage(senderId, null, '❌ Bale rejected the file.');
+      await sendTelegramMessage(senderId, null, '❌ بله فایل را رد کرد.');
     }
     return;
   }
@@ -1754,11 +1995,11 @@ async function sendBufferToBaleInChunks(senderId, recipientId, buffer, fileName,
     const chunk = buffer.slice(start, end);
     const chunkName = `${baseName}.part${i + 1}of${totalChunks}${ext}`;
 
-    await sendTelegramMessage(senderId, null, `📤 Sending part ${i + 1}/${totalChunks} (${formatSize(chunk.byteLength)})...`);
+    await sendTelegramMessage(senderId, null, `📤 ارسال بخش ${i + 1} از ${totalChunks} (${formatSize(chunk.byteLength)})...`);
 
     const ok = await sendChunkToBale(recipientId, chunk, chunkName, 'document');
     if (!ok) {
-      await sendTelegramMessage(senderId, null, `❌ Failed to send part ${i + 1}/${totalChunks}.`);
+      await sendTelegramMessage(senderId, null, `❌ ارسال بخش ${i + 1} از ${totalChunks} ناموفق بود.`);
       allOk = false;
       break;
     }
@@ -1766,8 +2007,8 @@ async function sendBufferToBaleInChunks(senderId, recipientId, buffer, fileName,
 
   if (allOk) {
     await sendTelegramMessage(senderId, null,
-      `✅ All ${totalChunks} parts sent successfully!\n\n` +
-      `ℹ️ To reassemble, use the tool or run:\n` +
+      `✅ همه ${totalChunks} بخش با موفقیت ارسال شدند!\n\n` +
+      `ℹ️ برای ترکیب از ابزار وب یا دستور زیر استفاده کنید:\n` +
       `\`cat ${baseName}.part*of${totalChunks}${ext} > ${fileName}\``
     );
   }
@@ -1821,13 +2062,27 @@ async function sendTelegramMessage(chatId, replyId, text) {
     text: text,
     parse_mode: 'Markdown'
   };
+
   if (replyId) params.reply_to_message_id = replyId;
 
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params)
   });
+
+  const data = await res.json();
+
+  // If Markdown caused a parse error, retry as plain text
+  if (!data.ok && data.error_code === 400 && data.description?.includes('parse')) {
+    const plain = { chat_id: chatId, text };
+    if (replyId) plain.reply_to_message_id = replyId;
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(plain)
+    });
+  }
 }
 
 async function getFile(fileId) {
