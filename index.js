@@ -1438,7 +1438,7 @@ async function processMessage(message) {
   const mapping = USER_MAPPING[userId];
 
   if (!mapping) {
-    await sendTelegramMessage(userId, message.message_id, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${userId}`);
+    await sendTelegramMessage(userId, message.message_id, '❌ شما مجاز به استفاده از این ربات نیستید.');
     return;
   }
 
@@ -1494,7 +1494,7 @@ async function processBaleMessage(message) {
 
   // Only accept messages from known Bale recipients
   if (!BALE_TO_TG[baleUserId]) {
-    await sendBaleMessage(baleUserId, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${baleUserId}`);
+    await sendBaleMessage(baleUserId, '❌ شما مجاز به استفاده از این ربات نیستید.');
     return;
   }
 
@@ -1648,17 +1648,60 @@ async function sendRubikaMessage(chatId, text) {
 }
 
 async function sendRubikaDocument(chatId, fileBuffer, fileName) {
-  const mimeType = guessMimeType(fileName);
-  const formData = new FormData();
-  formData.append('chat_id', chatId);
-  formData.append('document', new Blob([fileBuffer], { type: mimeType }), fileName);
+  try {
+    // Step 1: Request an upload URL from Rubika
+    // Determine file type for Rubika's FileTypeEnum
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    const imageExts = new Set(['jpg','jpeg','png','gif','webp','bmp']);
+    const videoExts = new Set(['mp4','mkv','avi','mov','webm']);
+    const audioExts = new Set(['mp3','ogg','wav','flac','m4a','aac']);
 
-  const response = await fetch(`https://botapi.rubika.ir/v3/${RUBIKA_BOT_TOKEN}/sendDocument`, {
-    method: 'POST',
-    body: formData
-  });
-  const result = await response.json();
-  return result.ok || result.status === 'OK';
+    let rubikaFileType = 'File'; // default
+    if (imageExts.has(ext)) rubikaFileType = 'Image';
+    else if (videoExts.has(ext)) rubikaFileType = 'Video';
+    else if (audioExts.has(ext)) rubikaFileType = 'Music';
+
+    const requestRes = await rubikaPost('requestSendFile', { type: rubikaFileType });
+    console.log('Rubika requestSendFile:', JSON.stringify(requestRes));
+
+    if (requestRes.status !== 'OK' || !requestRes.data?.upload_url) {
+      console.log('Rubika requestSendFile failed:', JSON.stringify(requestRes));
+      return false;
+    }
+
+    const uploadUrl = requestRes.data.upload_url;
+
+    // Step 2: Upload the file bytes to the received upload_url
+    const mimeType = guessMimeType(fileName);
+    const uploadFormData = new FormData();
+    uploadFormData.append('file', new Blob([fileBuffer], { type: mimeType }), fileName);
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      body: uploadFormData
+    });
+    const uploadData = await uploadRes.json();
+    console.log('Rubika upload result:', JSON.stringify(uploadData));
+
+    // file_id can be at root or nested under data
+    const fileId = uploadData.file_id || uploadData.data?.file_id;
+    if (!fileId) {
+      console.log('Rubika upload failed — no file_id returned');
+      return false;
+    }
+
+    // Step 3: Send the file using the file_id
+    const sendRes = await rubikaPost('sendFile', {
+      chat_id: chatId,
+      file_id: fileId,
+    });
+    console.log('Rubika sendFile result:', JSON.stringify(sendRes));
+
+    return sendRes.status === 'OK';
+  } catch (e) {
+    console.log('Rubika sendRubikaDocument error:', e.message);
+    return false;
+  }
 }
 
 async function sendBufferToRubikaInChunks(senderId, rubikaRecipient, buffer, fileName) {
@@ -1712,7 +1755,7 @@ async function processRubikaMessage(chatId, newMessage) {
 
   const rubikaTgMap = getRubikaToTgMap();
   if (!rubikaTgMap[rubikaId]) {
-    await sendRubikaMessage(rubikaId, `❌ شما مجاز به استفاده از این ربات نیستید.\nآی‌دی عددی شما: ${rubikaId}`);
+    await sendRubikaMessage(rubikaId, '❌ شما مجاز به استفاده از این ربات نیستید.');
     return;
   }
 
@@ -2041,6 +2084,7 @@ async function sendChunkToBale(recipientId, buffer, fileName, mediaType) {
 
   formData.append(field, new Blob([buffer], { type: mimeType }), fileName);
   const result = await balePost(endpoint, formData);
+  console.log(`Bale ${endpoint} result:`, JSON.stringify(result));
   return result.ok;
 }
 
@@ -2051,7 +2095,11 @@ async function balePost(method, formData) {
     method: 'POST',
     body: formData
   });
-  return response.json();
+  const result = await response.json();
+  if (!result.ok) {
+    console.log(`Bale API error [${method}]:`, JSON.stringify(result));
+  }
+  return result;
 }
 
 // ==================== Telegram API Methods ====================
